@@ -1,0 +1,903 @@
+---
+title: "Servicios Ubicuos Adaptativos ExtraSensory Project"
+author:
+  - "José Manuel Bernabé Murcia"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document: default
+---
+```{r librarys, message=FALSE}
+library(tidyverse)
+library(lubridate)
+library(reshape2)
+library(dplyr)
+library(corrplot)
+library(ggplot2)
+library(anytime)
+library(scales)
+library(pvclust)
+library(caret)
+library(cluster)
+library(factoextra)
+library(mlbench)
+library(moments)
+library(gridExtra)
+library(rpart)
+library(partykit)
+library(e1071)
+library(randomForest)
+library(rattle)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction Dataset ExtraSensory 
+
+
+The dataset collects a set of behaviors on 60 subjects and recording the values of the sensors to relate it to said behavior. The sensors will be described later.
+
+The objective of this practice is that with these data we have to be able to use machine learning tools to help us identify the behaviors.
+
+
+# Reading the dataset
+
+Reading Data, There are 60 'csv.gz' files, one for each participant (user, subject) in the data collection. We ordered it by timestamp
+
+```{r reading, cache = TRUE}
+
+listaTemp = list.files('data/', pattern = '.*csv')
+data <- (read.csv(file=paste("data/",listaTemp[1], sep=""), header=TRUE, sep=","))
+id <- str_extract(listaTemp[1],"^[A-Z|0-9-]*")
+idColumna <-  data.frame(c(rep(id,nrow(data))))
+idUser <- idColumna
+colnames(idUser)[1] <- "idUser"
+
+
+
+for(i in 2:length(listaTemp)){
+  temp <- (read.csv(file=paste("data/",listaTemp[i], sep=""), header=TRUE, sep=","))
+  id <- str_extract(listaTemp[i],"^[A-Z|0-9-]*")
+  idColumna <- data.frame(c(rep(id,nrow(temp))))
+  colnames(idColumna)[1] <- "idUser"
+  idUser <- rbind(idUser, idColumna)
+  data <- rbind(data, temp)
+}
+
+
+
+```
+
+# Pre-Analysis
+
+Before starting the analysis we will try to eliminate or replace the null values. The discrete values will be replaced by mode and continuous values by the average.
+
+
+1. First we will analyze if we have a whole column of NA's, in which case we will eliminate it.
+2. The column that exceeded 70% with null values will be eliminated.
+3. The remaining values will be replaced.
+
+```{r pre_analisis}
+
+#Funcion que calcula la moda
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+
+columnas_eliminar <- c()
+data <- data[,colSums(is.na(data))<nrow(data)]
+j <- 0
+for(i in 1:ncol(data)){
+  if(sum(is.na(data[,i])) > 0){
+    if(((sum(is.na(data[,i]))*100)/(sum(!is.na(data[,i]))+sum(is.na(data[,i])))) >= 70 ){
+         cat("Columnas que se eliminarán por superan el umbral de NA's: ",colnames(data[i]),"(>=70% NA's)\n")
+         columnas_eliminar[j] <- i;
+         j<-j+1;
+    }
+  }
+}
+
+data <- select(data, -columnas_eliminar)
+
+
+for(i in 1:ncol(data)){
+  if(startsWith(as.character(colnames(data[i])), "label")){
+    if((getmode(data[,i])) == 'NaN') data[is.na(data[,i]), i] <- 0
+    else data[is.na(data[,i]), i] <- getmode(data[,i])
+    
+  }
+  else{
+     data[is.na(data[,i]), i] <- mean(data[,i], na.rm = TRUE)
+  }
+}
+
+data_individuos <- cbind(data, idUser)
+data <- arrange(data, data$timestamp)
+
+
+```
+
+## Coding the output
+
+we will only treat six context labels that will be the main behaviors, therefore, we will generate a column which will contain for each row the name of the label that corresponds to the behavior, and an additional one with the unknown value
+
+
+```{r codificando_salida}
+labels <- select(data, (c('label.LYING_DOWN', 'label.SITTING', 'label.OR_standing', 'label.FIX_walking', 'label.FIX_running', 'label.BICYCLING')))
+z <- 1
+
+cod.salida <- c()
+for(i in 1:nrow(labels)){
+  etiqueta_seguida <- 0
+  for(j in 1:ncol(labels)){
+    if (labels[i,j] == 1){
+      if(etiqueta_seguida == 1){
+        cod.salida[z] <- paste(cod.salida[z] , colnames(labels[j]), sep='+');
+      }
+      else{
+        cod.salida[z] <-colnames(labels[j]);
+      }
+      
+      etiqueta_seguida <- 1
+      
+    }
+    
+     
+  }
+  if(etiqueta_seguida == 0) cod.salida[z] <- "NS/NC"
+  z<-z+1;
+}
+
+
+
+```
+
+
+# Characterize data features on the sensors available
+
+## Which sensors are there and what types of data them produce
+
+|         Sensor        | Measurements               |
+|:---------------------:|----------------------------|
+| Accelerometer         | 3-Axis (40Hz)              |
+| Gyroscope             | 3-Axis (40Hz)              |
+| Magnetometer          | 3-Axis (40Hz)              |
+| Watch Accelerometer   | 3-Axis (25Hz)              |
+| Watch Compass         | Heading angle (var)        |
+| Location              | Long-lat-alt (var)         |
+| Location precomputed  | Location Variability (1pe) |
+| Audio                 | 13MFCC (46ms frames)       |
+| Audio power           | 1pe                        |
+| Phone State           | 1pe                        |
+| Low frequency sensors | 1pe                        |
+
+
+"1pe"" means sampled once per example. "var" means variable sampling rate — gathering updates whenever the value changes.
+
+
+Now I will visualize them directly from the dataset
+
+```{r }
+sensors <- select(data, matches("(^raw_acc|^proc_gyro|^raw_magnet|^watch_acceleration|^watch_heading|^location|^location_quick_features|^audio_naive|^audio_properties|^discrete|^lf_measurements)"))
+
+nameSensor <- "empty"
+typeSensor <- "Na"
+
+for(i in 1:length(sensors)){
+  if(nameSensor == unlist(strsplit(names(sensors[i]), ".", fixed = TRUE))[[1]]){
+    next;
+  } 
+    
+  nameSensor <- unlist(strsplit(names(sensors[i]), ".", fixed = TRUE))[[1]]
+  cat(sprintf("%-40s %s\n",names(sensors[i]),typeof(sensors[[i]])))
+}
+
+```
+
+All the data they produce are numeric, as we can see. Further, for each sensor we have statistics of the magnitude signal such as: mean, standar deviation, third moment, fourth moment, 25 percentile, 50 percentile, 75 percentile, value entropy and time entropy, but I have grouped them so as not to make the document very long.
+
+## Are they correlated?
+
+Having so many variables, we will use a correlation matrix between two variables only, since if we use all the varibles it would be practically impossible to see anything. In this case I have selected all the variables of the gyroscope and the accelerometer.
+
+
+```{r correlated_sensors}
+sensors <- select(data, matches("(^proc_gyro|^raw_acc)"))
+sensors[is.na(sensors)] <- 0
+oc_cor <- cor(sensors)
+oc_cor[is.na(oc_cor)]  <- 0
+corrplot(oc_cor, method="color",type = "full", order = "hclust", tl.col = "black", tl.cex = 0.6 )
+
+```
+
+As you can see the sensors (accelerometer and gyroscope), they have both positive and negative correlations between attributes. This makes us think that by applying some feature selection technique we could obtain the most representative variables.
+
+
+Since we have correlations, I will execute the algorithm of simple elimination of correlation variables by threshold, the objective is to remain with fewer variables since with many variables an overfit can be produced. In order to execute it, the algorithm must not receive constant variables (standard deviation 0), nor columns with null values, which we have already discussed.
+
+
+
+```{r Simple_feature_elimination, cache=TRUE}
+features <- select(data, -starts_with('label'))
+features <- select(features, -starts_with('timestamp'))
+colnum_features <- ncol(features)
+#Eliminamos las columnas donde la desviación estandar sea cero.
+features<- Filter(var, features)
+cat("Teniamos un total de variables antes de eliminar: ",colnum_features, ". Ahora tenemos un total de: ",ncol(features))
+
+remove = findCorrelation(cor(features), cutoff=0.9)
+cat("Variables to remove are",colnames(features[remove]),"\n", "\nTenemos un total de variables a eliminar de: ",length(remove)," varibles.\n")
+features <- select(features, -c(remove))
+cat("Teniamos un total de variables antes de eliminar: ",colnum_features,"Ahora tenemos un total de: ",ncol(features)," variables.")
+#corrplot(cor(features), type = "upper", tl.pos = "td", method = "circle", tl.cex = 0.5, tl.col = 'black')
+
+```
+
+Later we will make use of algorithms to stay the most "important" predictors and thus be able to reduce it even more.
+
+
+## Distribution of data from sensors
+
+Now we will see how the data are distributed, to be able to know what type of distribution our data follow. For this I use the functions: skewness and kurtosis. From the library moments. I will show only the first 10 data, the other half I omit to not make the document too long.
+
+```{r distribucion_datos, cache=TRUE}
+
+for(i in 1:10){
+
+  cat("Skewness y kurtosis:",skewness(features[,i]),"/",kurtosis(features[,i]),colnames(features[,i]),"\n")
+
+  
+
+}
+
+
+```
+
+
+If the skewness is zero it means that the data follow a normal distribution, however, if we have a positive skewness greater than zero, the "tail" of the distribution points to the right. The kurtosis will tell us how "weeping" the data is, that is, if it is positive and the higher the value of the kurtosis the more weights are the data. For example, we can see this situation in the variable raw_acc.magnitude_stats.moment3 Plotting we will see it. It is not enough to see these few, but still we will have to normalize due to the specifications of the machine learning algorithms
+
+```{r plot_distribuciones, cache=TRUE}
+  ggplot(features, aes(x=features$raw_acc.magnitude_stats.moment3)) + geom_density()
+  ggplot(features, aes(x=features$raw_acc.magnitude_stats.moment3)) + 
+  geom_histogram(aes(y=..density.., fill=..count..))+ 
+  stat_function(fun=dnorm,color="red",args=list(mean=mean(features$raw_acc.magnitude_stats.moment3),sd=sd(features$raw_acc.magnitude_stats.moment3)))
+qqnorm(features$raw_acc.magnitude_stats.moment3)
+
+```
+
+Our data does not follow a normal distribution. Therefore, our data needs to be transformed, in this case scaled to be able to normalize them. Why? Because we have to put them on a common scale, since this will improve the understanding of their distribution and be able to compare them more easily avoiding the distortion of scale difference as well as the fact that in this way problems with the algorithms are avoided of adjustment of models that do not possess the property of invariance to scaling, for example, algorithms based on descent gradient (such as neural networks that use backpropagation).
+
+
+# Subjects
+
+The ExtraSensory dataset contains data from 60 users (34 subjects were female and 26 were
+male). The users would use their own phone, and possibly additional convenient devices, like watches (56 out of the 60 agreed to wear the watch). For the purpose of large-scale data collection the creators of extrasensory developed a mobile application for both iphone and android and for smartwatch (Pebble). The app was used to collect both sensor measurement and context labels. Every minute the app records a 20sec window of sensor measurements from the phone and watch.
+
+We can see the different context labels and the time that we have. 
+
+
+```{r label-context2, cache = TRUE}
+
+labels <- select(data, starts_with('label'))
+timeLabel <- select(labels, -label_source)
+timeLabel <- apply(timeLabel,2,function(x){sum(as.numeric(x), na.rm = TRUE)})
+timeLabel <- sort(timeLabel, decreasing = TRUE)
+
+
+
+ 
+for (i in 1:length(timeLabel)){
+  cat(sprintf("%-40s %d minutes \n",names(timeLabel[i]),unname(timeLabel[i])))
+  
+}
+
+```
+
+We can see the test times we have in our whole set.
+
+## Report types
+
+
+The users could report of two types:
+
+1. Main activity. Labels describing movement or posture of the user.
+2. Secondary activity. Labels describing more specific context in different aspects: sports (e.g. playing basketball, at the gym), transportation (e.g. drive - I'm the driver, on the bus), basic needs (e.g. sleeping, eating, toilet), company (e.g. with family, with co-workers), location (e.g. at home, at work, outside) etc.
+Multiple secondary labels can be applied to an example.
+
+## Try search patterns and relationships
+
+In this picture we can see on the X axis we have the hours and on the Y axis we have the context labels. In this way it is already possible to see routines and patterns, For example, on May 25 and 26.
+
+
+```{r day25, cache = TRUE}
+labels_day <- select(data, starts_with('label'))
+labels_day <- cbind(labels_day, data$timestamp)
+labels_day <- melt(labels_day, c('data$timestamp'))
+colnames(labels_day)[1] <- 'timestamp'
+fecha <- anytime(labels_day$timestamp, tz="PST8PDT")
+fecha <- format(as.POSIXct(fecha, "%Y-%m-%d %H:%M:%S", tz = ""), format = "%Y-%m-%d %H:%M")
+labels_day <- cbind(labels_day, fecha)
+labels_day <- filter(labels_day, format(as.POSIXct(labels_day$fecha, "%Y-%m-%d %H:%M", tz = ""), format = "%Y-%m-%d") == "2016-05-25")
+labels_day <- filter(labels_day, value == 1)
+
+
+
+ggplot(data = labels_day, aes(x = as.POSIXct(labels_day$fecha), y = variable, color=variable) )+
+  geom_point()+
+  theme(legend.position = "none")+
+  scale_x_datetime(
+    breaks = seq(min(as.POSIXct(labels_day$fecha)),
+                 max(as.POSIXct(labels_day$fecha)), "1 hours"),
+     labels = date_format("%H", tz = "CET")
+    )+
+  labs(x  = "25 May", y = "Context-labels")
+
+```
+
+
+```{r day26, cache = TRUE}
+
+labels_day <- select(data, starts_with('label'))
+labels_day <- cbind(labels_day, data$timestamp)
+labels_day <- melt(labels_day, c('data$timestamp'))
+colnames(labels_day)[1] <- 'timestamp'
+fecha <- anytime(labels_day$timestamp, tz="PST8PDT")
+fecha <- format(as.POSIXct(fecha, "%Y-%m-%d %H:%M:%S", tz = ""), format = "%Y-%m-%d %H:%M")
+labels_day <- cbind(labels_day, fecha)
+labels_day <- filter(labels_day, format(as.POSIXct(labels_day$fecha, "%Y-%m-%d %H:%M", tz = ""), format = "%Y-%m-%d") == "2016-05-26")
+labels_day <- filter(labels_day, value == 1)
+horas_dia_26 <- format(as.POSIXct(labels_day$fecha, "%H:%M", tz = ""), format = "%H")
+
+
+
+ggplot(data = labels_day, aes(x = as.POSIXct(labels_day$fecha), y = variable, color=variable) )+
+  geom_point()+
+  theme(legend.position = "none")+
+  scale_x_datetime(
+    breaks = seq(min(as.POSIXct(labels_day$fecha)),
+                 max(as.POSIXct(labels_day$fecha)), "1 hours"),
+     labels = date_format("%H", tz = "CET")
+    )+
+  labs(x  = "26 May", y = "Context-labels")
+  
+
+```
+
+
+
+We can intuit from the images that there is a relationship between 00:00 and 08:00 with the context labels: sleeping and lying down. But it's hard to appreciate with all the individuals together.
+
+## Correlation matrix between the context labels
+
+With the correlation matrix it is easier to see the correlations between the labels.
+
+```{r occurence, cache = TRUE}
+oc <- select(data, starts_with('label'))
+oc <- select(oc, -starts_with('label_source'))
+oc[is.na(oc)] <- 0
+oc <- oc[, colSums(oc) > 1]
+oc_cor <- cor(oc)
+oc_cor[is.na(oc_cor)]  <- 0
+corrplot(oc_cor, method="color",type = "full", order = "hclust", tl.col = "black", tl.cex = 0.6 )
+
+```
+
+
+I have also used the hierarchical clustering technique using the agglomerative method (AGNES). Clustering is a technique to group similar data points in a group and separate the different observations into different groups.  In Hierarchical Clustering, clusters are created so that they have a predetermined. 
+
+We can see groupings that we have detected before visualizing the data.
+
+```{r correlacion1 cluster, cache = TRUE}
+set.seed(123)
+oc <- select(data, starts_with('label'))
+oc <- select(oc, -starts_with('label_source'))
+oc[is.na(oc)] <- 0
+oc <- oc[, colSums(oc) > 1]
+#oc <- t(oc)
+oc.pre <- preProcess(oc,method="scale")
+oc.scaled <- predict(oc.pre, oc)
+oc.diana <- agnes(t(oc.scaled), metric="euclidean")
+pltree(oc.diana,cex=.6)
+
+
+```
+
+
+
+here I set K equal to 8, to point out the clusters (It's a random value)
+
+```{r correlacion4 cluster, cache = TRUE}
+set.seed(123)
+oc <- select(data, starts_with('label'))
+oc <- select(oc, -starts_with('label_source'))
+oc[is.na(oc)] <- 0
+oc <- oc[, colSums(oc) > 1] #Evito columnas sin más de un ejemplo
+#oc <- t(oc)
+oc.pre <- preProcess(oc,method="scale")
+oc.scaled <- predict(oc.pre, oc)
+oc.agnes <- agnes(t(oc.scaled), metric="euclidean")
+pltree(oc.agnes, hang=-1, cex = 0.6)
+rect.hclust(oc.agnes, k = 8, border = 2:10)
+
+
+```
+
+Now we can visualize some groups that we have found using clustering techniques or fixing ourselves in the correlation matrix, since they make sense. For example, when you are at home lying down you are sleeping.
+
+## Table subjects examples
+
+```{r relation, cache = TRUE}
+
+
+
+tabla_registros <- data_individuos %>% 
+  group_by(idUser) %>% 
+  summarise(LYING_DOWN = sum(label.LYING_DOWN, na.rm = TRUE), SITTING= sum(label.SITTING, na.rm = TRUE), OR_Standing= sum(label.OR_standing, na.rm = TRUE), FIX_walking= sum(label.FIX_walking, na.rm = TRUE), FIX_running= sum(label.FIX_running, na.rm = TRUE), BICYCLING= sum(label.BICYCLING, na.rm = TRUE))
+
+ tabla_registros <- arrange(tabla_registros, tabla_registros$LYING_DOWN, tabla_registros$SITTING,tabla_registros$OR_Standing, tabla_registros$FIX_walking, tabla_registros$FIX_running, tabla_registros$BICYCLING)
+ 
+ tabla_registros
+
+```
+
+Here we have the subject with your examples. We can think in remove some subject that have few examples and can introduce some noise, but we can only know if we will study it more in depth.
+
+
+# Making our model and training it
+
+
+## Making timestamp a cyclic variable for machine learning
+
+Before starting with the transformation of the model, I will create two variables to represent the time cycle that the variable timestamp has. Once created, you will not have to use the timestamp, therefore, the elimination.
+
+The objective is to convert the time stamp variable that is cyclical in such a way that the machine learning algorithm is also known to be cyclical
+
+
+https://ianlondon.github.io/blog/encoding-cyclical-features-24hour-time
+
+![](output_time.png)
+
+Notice that the distance between a point as 5 minutes before and 5 minutes after the split is very large. This is undesirable: we want our machine learning model to see that 23:55 and 00:05 are 10 minutes apart, but as it stands, those times will appear to be 23 hours and 50 minutes apart!
+
+The x position swings back and forth out of sink with the y position. For a 24-hour clock you can accomplish this with x=sin(2pi*hour/24),y=cos(2pi*hour/24).
+
+You need both variables or the proper movement through time is lost. This is due to the fact that the derivative of either sin or cos changes in time where as the (x,y) position varies smoothly as it travels around the unit circle.
+
+
+```{r transformacion_timestamp, cache=TRUE}
+set.seed(123)
+
+seconds_in_day = 24*60*60
+
+time1 <- as.data.frame(sin(2*pi*data["timestamp"]/seconds_in_day))
+time2 <- as.data.frame(cos(2*pi*data["timestamp"]/seconds_in_day))
+
+colnames(time1) <- "timeSin"
+colnames(time2) <- "timeCos"
+
+tiempo_ciclico <- cbind(time1, time2)
+
+
+data<-cbind(tiempo_ciclico, data)
+
+ggplot(data, aes(timeSin))+geom_density()
+ggplot(data, aes(timeCos))+geom_density()
+
+ggplot(data, aes(timeSin, timeCos))+geom_point()
+
+horas <- anytime(data$timestamp, tz="PST8PDT")
+horas <- format(as.POSIXct(horas, "%Y-%m-%d %H:%M:%S", tz = ""), format = "%Y-%m-%d %H:%M")
+horas <- format(as.POSIXct(horas, "%Y-%m-%d %H:%M", tz = ""), format = "%H")
+```
+
+
+## Normalizing the features. 
+
+For the algorithms that we are going to use as rpart and randomForest, these require that the data be normalized, therefore, we use preprocess and normalize our data.
+
+
+```{r transformacion, cache=TRUE}
+set.seed(123)
+timeSin <- select(data, starts_with('timeSin'))
+timeCos <- select(data, starts_with('timeCos'))
+labels <- select(labels, -starts_with("label_source"))
+#La parte de los features ya la tenemos lista. 
+
+
+#los labels NA como ceros
+for(i in 1:ncol(labels)){
+  labels[is.na(labels[,i]), i] <- 0
+}
+
+datos_todo <- cbind(features, cod.salida)
+datos_todo <- cbind(timeSin, datos_todo)
+datos_todo <- cbind(timeCos, datos_todo)
+
+
+
+#Estimamos los valores para normalizar usando el conjunto de entrenamiento
+# Solo usamos las variables que vayamos a preprocesar
+preProcMod<-preProcess(datos_todo[colnames(features)],method=c("center","scale"))
+# Aplicamos las transformaciones a ambos conjuntos
+datos_todo.Transf<-predict(preProcMod,datos_todo)
+
+Vars_Entrada <- colnames(select(datos_todo.Transf, -starts_with('cod.salida')))
+```
+
+
+We are going to try to eliminate more predictors since we have too many. I tried to use rfe with rfFuncs, but the algorithm took more than 40 hours to execute and it did not end. Therefore, I applied the randomForest function and I have stayed with the most important predictors (those that were above the average).
+
+```{r training_randomForest, cache=TRUE, eval = FALSE}
+
+
+randomForest <- randomForest( x= datos_todo.Transf[Vars_Entrada], 
+y = as.factor(datos_todo.Transf$cod.salida))
+
+cat("Mostramos la información del random forest: ")
+print(randomForest)
+
+saveRDS(randomForest, "randomForest.rds")
+
+
+```
+
+```{r cargamos_randomForest}
+
+randomForest <- readRDS('randomForest.rds')
+print(randomForest)
+
+var.destacadas <- varImp(randomForest)
+var.destacadas$var <- rownames(var.destacadas)
+
+
+mean(var.destacadas$Overall)
+
+
+var.destacadas <- filter(var.destacadas, var.destacadas$Overall > mean(var.destacadas$Overall))
+cat("El total de variables que superan la media de importancia que serán seleccionadas son: ",nrow(var.destacadas),'\n')
+for(i in 1:nrow(var.destacadas))
+  cat("\n",var.destacadas$var[i], ':',var.destacadas$Overall[i])
+
+datos_todo.Transf.RF <- select(datos_todo.Transf, (var.destacadas$var))
+datos_todo.Transf.RF <- cbind(datos_todo.Transf.RF, cod.salida)
+
+Vars_Entrada.RF <- colnames(select(datos_todo.Transf.RF, -starts_with('cod.salida')))
+
+
+```
+
+```{r features_destacadas_eliminacion_recursiva, eval = FALSE}
+
+#IMPOSIBLE DE EJECUTAR. NO TERMINA NI DESPUES DE 40 HORAS.
+ctrl = rfeControl(functions = rfFuncs,
+                   method = "repeatedcv",
+                   repeats = 5,
+                   p = 0.75,
+                   verbose = TRUE)
+
+
+
+rfProfile = rfe(datos_todo.Transf.RF[Vars_Entrada.RF],as.factor(datos_todo.Transf.RF$cod.salida),
+                data = datos_todo.Transf.RF,
+                 sizes = c(1:173),
+                 rfeControl = ctrl)
+rfProfile
+
+
+saveRDS(lmProfile, "rfeRfFunc.rds")
+
+```
+
+
+
+```{r training_rf, eval=FALSE}
+
+set.seed(123)
+trainCtrl <- trainControl(method="repeatedcv",
+                       repeats=4,
+                       number=4,
+                       p = 0.75,
+                       verbose = TRUE
+                       )
+
+modelo.rf<-train( datos_todo.Transf.RF[Vars_Entrada.RF], datos_todo.Transf.RF$cod.salida,
+                      trControl = trainCtrl,
+                      method='rf')
+
+
+cat("Mostramos la información de rpart: ")
+print(modelo.rf)
+saveRDS(modelo.rf, "modeloRf.rds")
+
+
+
+
+```
+
+
+```{r training_rpart, eval=FALSE}
+
+set.seed(123)
+trainCtrl <- trainControl(method="repeatedcv",
+                       repeats=10,
+                       number=5,
+                       p = 0.75,
+                       verbose = TRUE
+                       )
+
+modelo.rpart<-train( datos_todo.Transf.RF[Vars_Entrada.RF], datos_todo.Transf.RF$cod.salida,
+                      
+                      trControl = trainCtrl,
+                      method='rpart')
+
+
+cat("Mostramos la información de rpart: ")
+print(modelo.rpart)
+saveRDS(modelo.rpart, "modeloRpart.rds")
+
+
+
+
+```
+
+```{r training_rpart_ajustando_hiperparametros, eval =FALSE}
+
+set.seed(123)
+trainCtrl <- trainControl(method="repeatedcv",
+                       repeats=10,
+                       number=5,
+                       p = 0.75,
+                       verbose = TRUE
+                       )
+
+modelo.rpart2<-train( datos_todo.Transf.RF[Vars_Entrada.RF], datos_todo.Transf.RF$cod.salida,
+                      tuneLength = 50,
+                      trControl = trainCtrl,
+                      method='rpart')
+
+
+cat("Mostramos la información de rpart: ")
+print(modelo.rpart2)
+saveRDS(modelo.rpart2, "modeloRpartTuneLength.rds")
+
+
+
+
+```
+
+```{r}
+modelo.rf <- readRDS('modeloRf.rds')
+modelo.rpart <- readRDS('modeloRpart.rds')
+modelo.rpart2 <- readRDS('modeloRpartTuneLength.rds')
+
+
+```
+
+## Comparing models
+
+We will compare the RF and Rpart method, to compare the models we look at the measures: Accuracy and Kappa. The measure of accuracy can give problems with unbalanced classes, so it is advisable in these cases the Kappa coefficient, which tells us how "good" a result is given a value.
+
+Rpart with hyperparameters vs Rpart without hyperparameters
+
+```{r comparando_modelos_rpart}
+
+sensory.modelList.rpart<-list(RPART_Simple=modelo.rpart
+,RPART_Hiperparameter=modelo.rpart2
+)
+
+
+sensory.resamp.rpart <- resamples(sensory.modelList.rpart)
+trellis.par.set(caretTheme())
+
+d1 <- densityplot(sensory.resamp.rpart,
+scales =list(x = list(relation = "free"),
+y = list(relation = "free")),
+auto.key = list(columns = 2),
+pch = "|")
+
+print(d1,position=c(0,0,1,1),more=T)
+confusionMatrix(modelo.rpart)
+confusionMatrix(modelo.rpart2)
+
+```
+
+
+```{r comparando_modelos_rf_rpart}
+
+d2 <- densityplot(modelo.rpart2, main = "Rpart con hiperparámetros")
+d1 <- densityplot(modelo.rf, main = "RF")
+print(d1,position=c(0,0,0.5,1),more=T)
+print(d2,position=c(0.5,0,1,1),more=T)
+
+confusionMatrix(modelo.rpart2)
+confusionMatrix(modelo.rf)
+
+
+```
+
+```{R comparando_modelos_global}
+
+
+d2 <- densityplot(modelo.rpart2, main = "Rpart con hiperparámetros", metric = "Kappa")
+d1 <- densityplot(modelo.rf, main = "RF", metric = "Kappa")
+print(d1,position=c(0,0,0.5,1),more=T)
+print(d2,position=c(0.5,0,1,1),more=T)
+
+```
+
+We can observe that the model with the adjustment in the hyperparameters of the best results, but still, far from the random forest method that is the one that best compares for this classification problem, but a very high computational cost than the algorithm with the "RF" method has taken 36 hours to execute.
+
+Therefore, we can say that the random forest is the one that best behaves for this classification problem. Even if we modify the rpart hyperparameters, this is not a random forest.
+
+# Neuronal Network
+
+Making use of Keras which is a wrapper, developed in Python, to several low level deep learning frameworks, including
+TensorFlow. I use keras in its GPU version to have a higher level of processing.
+
+```{R keras_install}
+
+library(processx)
+library(devtools)
+library(reticulate)
+library(keras)
+
+```
+
+
+To perform the MLP, the data has been reloaded from the beginning, but in this we have taken all the predictors.
+
+```{r datos_mlp, eval = FALSE}
+
+labels <- select(data, (c('label.LYING_DOWN', 'label.SITTING', 'label.OR_standing', 'label.FIX_walking', 'label.FIX_running', 'label.BICYCLING')))
+datos_entrada <- cbind(tiempo_ciclico, features)
+datos_entrada <- cbind(datos_entrada, labels)
+
+vars_entrada <- colnames(select(datos_entrada, -starts_with('label')))
+vars_salida <- colnames(select(datos_entrada, starts_with('label')))
+
+#Estimamos los valores para normalizar usando el conjunto de entrenamiento
+# Solo usamos las variables que vayamos a preprocesar
+preProcMod<-preProcess(datos_entrada[(vars_entrada)],method=c("center","scale"))
+# Aplicamos las transformaciones a ambos conjuntos
+datos_mlp<-predict(preProcMod,datos_entrada)
+
+
+
+
+```
+
+## First model MLP
+
+We build the model, at the moment we are only going to have a hidden layer. In summary, we have 173 input nodes, 80 in the hidden layer and 6 output nodes corresponding to the main context labels that we want to figure out.
+
+For activation in the input we will use leaky type RelU that allows us negative values (-infinity to + infinity).
+At the exit we will have a sigmoid type activation since the range for sigmoid is between 0 and 1.
+
+The network uses the efficient Adam gradient descent optimization algorithm with a logarithmic loss function, which is called “categorical_crossentropy”. 
+
+Adam is a combining the advantages of two other extensions of stochastic gradient descent. Specifically: Adaptive Gradient Algorithm (AdaGrad) and Root Mean Square Propagation (RMSProp).
+
+
+
+```{r preparacion_mlp, eval = FALSE}
+
+
+
+model = keras_model_sequential()
+model %>%
+layer_dense(units = 80, activation = layer_activation_leaky_relu(), input_shape = (173)) %>%
+layer_dense(units = 6, activation = 'sigmoid')
+summary(model)
+
+model %>% compile(
+loss = 'binary_crossentropy',
+optimizer = optimizer_adam(),
+metrics = c('accuracy'))
+
+
+
+
+```
+
+This operation from top to top generates, as we see, 14406 parameters. We have 173 input nodes. 80 nodes in the hidden layer and 6 at the exit. Between the layer of input nodes and the hidden one, we will generate 173 × 80 pesos (one for each connection). In addition, each node in the hidden layer will introduce a bias, which will also be accompanied by its corresponding weight, in total 80 pesos more.
+
+```{r training_mlp, eval = FALSE}
+set.seed(123)
+history = model %>% fit(
+as.matrix(datos_mlp[vars_entrada]), 
+as.matrix(datos_mlp[vars_salida]),
+epochs = 20,
+batch_size = 128,
+validation_split = 0.2,
+verbose = 2
+)
+
+saveRDS(history, "mlp.rds")
+
+```
+We have quite good training and evaluation errors considering that we have only a hidden layer of 80 nodes.
+Now we plot the training and validation errors throughout the epochs.
+
+```{r plot_mlp}
+history <- readRDS("mlp.rds")
+
+cat("Los errores de entrenamiento y evaluación finales son", history$metrics$loss[20],"y",
+history$metrics$val_loss[20],"\n")
+
+cat("Los valores de accuracy de entrenamiento y evaluación finales son", history$metrics$acc[20],"y",
+history$metrics$val_acc[20],"\n")
+
+plot(history)
+
+vymax = max(c(history$metrics$loss,history$metrics$val_loss))
+plot(history$metrics$loss,main="Training/Validation errors for Extrasensory",col="blue",
+     type="l",xlab="Epochs",ylab="Loss",ylim=c(0,vymax))
+lines(history$metrics$val_loss,col="red")
+```
+
+As we can see, the validation error gets worse after a specific number of epochs. Which means that we have overfitting, We will try to solve it by adding a layer with dropout and we will modify our model adding more complexity. We are going to add two more layers, one dropout and another 200 nodes and again layer dropout. We will increase the epochs and the batch_size.
+
+## Second model MLP
+
+```{r training_mlp_dropout, eval = FALSE}
+set.seed(123)
+
+model = keras_model_sequential()
+model %>%
+layer_dense(units = 80, activation = layer_activation_leaky_relu(), input_shape = (173)) %>%
+layer_dropout(rate=0.6) %>%
+layer_dense(units = 200)  %>%
+layer_dropout(rate=0.2) %>%
+layer_dense(units = 6, activation = 'sigmoid')
+summary(model)
+
+model %>% compile(
+loss = 'binary_crossentropy',
+optimizer = optimizer_adam(),
+metrics = c('accuracy'))
+
+
+history = model %>% fit(
+as.matrix(datos_mlp[vars_entrada]), 
+as.matrix(datos_mlp[vars_salida]),
+epochs = 100,
+batch_size = 160,
+validation_split = 0.2,
+verbose = 2
+)
+
+saveRDS(history, "dropout.rds")
+
+
+```
+
+```{r plot_mlp_dropout}
+
+history <- readRDS("dropout.rds")
+
+cat("Los errores de entrenamiento y evaluación finales son", history$metrics$loss[100],"y",
+history$metrics$val_loss[100],"\n")
+
+cat("Los valores de accuracy de entrenamiento y evaluación finales son", history$metrics$acc[100],"y",
+history$metrics$val_acc[100],"\n")
+
+plot(history)
+
+vymax = max(c(history$metrics$loss,history$metrics$val_loss))
+plot(history$metrics$loss,main="Training/Validation errors for Extrasensory",col="blue",
+     type="l",xlab="Epochs",ylab="Loss",ylim=c(0,vymax))
+lines(history$metrics$val_loss,col="red")
+
+```
+
+# Conclusions and future work
+
+I have not spent much time adjusting the MLP, but even so it has given us very good results even better than with random forest which we have also executed in a very simple way and has behaved better than others algorithm, because the Trees behave and adapt very well with classification problems.
+
+I personally prefer the neural networks that have taken much less time to execute than the rf method, probably because I had the possibility to run with the GPU
+
+As a possible extension it would be very interesting to try the elimination of recursive features (rfe) with rfFuncs, and improve the MLP, for example, removing input nodes, that is, keep the rfe predictors and modify the epochs, the number of layers and the number nodes per layer. Another very interesting extension would be to see in real time the model that we have generated for the prediction.
